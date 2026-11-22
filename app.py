@@ -29,7 +29,11 @@ import uuid
 from datetime import datetime
 from pathlib import Path
 
+import hmac as _hmac
+
 import gradio as gr
+from fastapi import FastAPI, Request
+from fastapi.responses import JSONResponse, RedirectResponse
 
 ROOT = Path(os.environ.get("DOPPLOC_WORK", "/tmp/doppler-web-work"))
 JOBS = ROOT / "jobs"
@@ -38,6 +42,55 @@ JOBS.mkdir(parents=True, exist_ok=True)
 DATA.mkdir(parents=True, exist_ok=True)
 
 APP_KEY = os.environ.get("DOPPLOC_APP_KEY", "")
+# Server-side gate: the key reaches the server once, in a POST body (never in a URL,
+# so it is not logged or leaked via referrer); the server sets an HttpOnly cookie that
+# every upload, job-action, queue and file route must then carry.
+import hashlib
+AUTH_COOKIE = "dopploc_auth"
+AUTH_TOKEN = hashlib.sha256(("dopploc-gate:" + APP_KEY).encode()).hexdigest() if APP_KEY else ""
+PROTECTED_PREFIXES = ("/upload", "/file", "/queue", "/gradio_api/queue", "/gradio_api/call",
+                      "/gradio_api/upload", "/gradio_api/component_server")
+
+fast = FastAPI()
+
+
+@fast.middleware("http")
+async def _gate(request, call_next):
+    if AUTH_TOKEN and request.url.path.startswith(PROTECTED_PREFIXES):
+        if request.cookies.get(AUTH_COOKIE) != AUTH_TOKEN:
+            return JSONResponse({"detail": "forbidden"}, status_code=403)
+    return await call_next(request)
+
+
+@fast.post("/dopploc-auth")
+async def _dopploc_auth(request: Request):
+    try:
+        data = await request.json()
+    except Exception:
+        data = {}
+    if APP_KEY and str(data.get("key", "")).strip() == APP_KEY:
+        r = JSONResponse({"ok": True})
+        r.set_cookie(AUTH_COOKIE, AUTH_TOKEN, httponly=True, secure=True,
+                     samesite="lax", max_age=60 * 60 * 24 * 30)
+        return r
+    return JSONResponse({"ok": False}, status_code=403)
+
+
+@fast.get("/dopploc-invite")
+async def _dopploc_invite(exp: int = 0, sig: str = ""):
+    """Expiring invite link: HMAC(APP_KEY, 'invite:<exp>') - carries no persistent
+    secret, dies at <exp>. Sets the same derived session cookie as the key flow."""
+    ok = False
+    if APP_KEY and exp and sig:
+        good = _hmac.new(APP_KEY.encode(), f"invite:{exp}".encode(), hashlib.sha256).hexdigest()
+        if _hmac.compare_digest(sig.strip(), good) and time.time() < exp:
+            ok = True
+    if not ok or not AUTH_TOKEN:
+        return JSONResponse({"ok": False}, status_code=403)
+    r = RedirectResponse("/", status_code=303)
+    r.set_cookie(AUTH_COOKIE, AUTH_TOKEN, httponly=True, secure=True,
+                 samesite="lax", max_age=60 * 60 * 24 * 30)
+    return r
 MAX_AUDIO_S = 20 * 60
 MAX_RADIUS_KM = 60
 MAX_SCORE_CANDIDATES = int(os.environ.get("DOPPLOC_MAX_SCORE", "2500"))
@@ -70,6 +123,11 @@ an independent re-implementation of the method from colsto's video.
 - Scoring here models still air (wind aloft is not fetched in this build), so expect
   the right neighbourhood rather than survey-grade coordinates.
 
+**Read results with care:** the search always returns best-fit candidates for the region
+you chose - it can return a plausible-looking ranked list even when the recording is not
+from that region at all. A rank-1 pin is a hypothesis to verify on the map, not a
+confirmed location; the raw score has no calibrated confidence meaning.
+
 **Privacy:** uploads are analysed in this session, then deleted (always within ~30
 minutes). Only anonymous public flight, terrain and weather data is cached. Nothing is
 shared. One analysis runs at a time; if the app is busy, try again in a few minutes.
@@ -78,8 +136,8 @@ shared. One analysis runs at a time; if the app is busy, try again in a few minu
 
 # ----------------------------------------------------------------- helpers
 
-def _check_key(key: str):
-    if APP_KEY and key.strip() != APP_KEY:
+def _check_key(key: str, key_link: str = ""):
+    if APP_KEY and (key or "").strip() != APP_KEY and (key_link or "").strip() != APP_KEY:
         raise gr.Error("Wrong access key.")
 
 
@@ -263,8 +321,8 @@ def _fetch_url(url: str, dl_root: Path, log) -> Path:
 
 # ----------------------------------------------------------------- step 1: detect
 
-def do_detect(key, file_path, url, start, dur):
-    _check_key(key)
+def do_detect(key, key_link, file_path, url, start, dur):
+    _check_key(key, key_link)
     if not JOB_LOCK.acquire(blocking=False):
         raise gr.Error("Another analysis is running - try again in a few minutes.")
     job = JOBS / uuid.uuid4().hex[:12]
@@ -324,8 +382,8 @@ def do_detect(key, file_path, url, start, dur):
 
 # ----------------------------------------------------------------- step 2: locate
 
-def do_locate(key, state, picks, day, lat, lon, radius_km):
-    _check_key(key)
+def do_locate(key, key_link, state, picks, day, lat, lon, radius_km):
+    _check_key(key, key_link)
     if not state or not state.get("events"):
         raise gr.Error("Run Detect first.")
     picks = picks or []
@@ -436,10 +494,9 @@ ratio = 1.0
         rows = []
         for i, r in enumerate(top, 1):
             rlat, rlon = float(r["lat"]), float(r["lon"])
-            rows.append({"rank": i, "lat": round(rlat, 5), "lon": round(rlon, 5),
-                         "score": round(float(r["score"]), 3),
-                         "flight 1": r["f1"].split(":")[0], "flight 2": r["f2"].split(":")[0],
-                         "map": f"https://www.openstreetmap.org/?mlat={rlat:.5f}&mlon={rlon:.5f}#map=16/{rlat:.5f}/{rlon:.5f}"})
+            rows.append([i, round(rlat, 5), round(rlon, 5), round(float(r["score"]), 3),
+                         r["f1"].split(":")[0], r["f2"].split(":")[0],
+                         f"https://www.openstreetmap.org/?mlat={rlat:.5f}&mlon={rlon:.5f}#map=16/{rlat:.5f}/{rlon:.5f}"])
         import folium
         fmap = folium.Map(location=[lat, lon], zoom_start=10)
         folium.Circle([lat, lon], radius=radius_km * 1000, color="#888", weight=1,
@@ -452,6 +509,10 @@ ratio = 1.0
                                 popup=f"#{i} score {float(r['score']):.2f}").add_to(fmap)
         map_html = fmap._repr_html_()
         summary = (out / "summary.md").read_text() if (out / "summary.md").exists() else ""
+        summary = ("**Best-fit candidates, not a verified location.** The search ranks the "
+                   "spots whose audible sky matches best *within the region you chose*; a wrong "
+                   "region can still produce plausible-looking matches. Verify on the map before "
+                   "trusting a pin.\n\n" + summary)
         rank1 = str(out / "rank1.png") if (out / "rank1.png").exists() else None
         log("done.")
         yield ("\n".join(lines), summary, rank1, map_html, rows)
@@ -464,7 +525,8 @@ ratio = 1.0
 with gr.Blocks(title="Doppler Locate playground") as demo:
     gr.Markdown(BANNER)
     key_in = gr.Textbox(label="Access key", type="password",
-                        placeholder="the key from the message that shared this link")
+                        placeholder="filled automatically from your private link")
+    key_link = gr.Textbox(visible=False)
     with gr.Group():
         gr.Markdown("### 1 - Find aircraft in a recording")
         with gr.Row():
@@ -498,13 +560,29 @@ with gr.Blocks(title="Doppler Locate playground") as demo:
     locate_summary = gr.Markdown()
     locate_img = gr.Image(label="winning pair: modelled curves over the recording", type="filepath")
     locate_map = gr.HTML()
-    locate_table = gr.Dataframe(label="top candidate spots", interactive=False)
+    locate_table = gr.Dataframe(label="top candidate spots", interactive=False,
+                                headers=["rank", "lat", "lon", "score", "flight 1", "flight 2", "map"])
 
-    detect_btn.click(do_detect, [key_in, file_in, url_in, start_in, dur_in],
+    detect_btn.click(do_detect, [key_in, key_link, file_in, url_in, start_in, dur_in],
                      [detect_log, detect_report, detect_img, detect_state, events_dl, detections_dl,
                       picks_in, locate_log])
-    locate_btn.click(do_locate, [key_in, detect_state, picks_in, day_in, lat_in, lon_in, radius_in],
+    locate_btn.click(do_locate, [key_in, key_link, detect_state, picks_in, day_in, lat_in, lon_in, radius_in],
                      [locate_log, locate_summary, locate_img, locate_map, locate_table])
+
+    key_in.change(None, key_in, None, js="""(k) => {
+  if (k) { fetch('/dopploc-auth', {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({key: k})}).then(r => { if (r.ok) localStorage.setItem('dopploc_key', k); }); }
+}""")
+
+    demo.load(None, None, key_link, js="""() => {
+  try {
+    const h = new URLSearchParams(location.hash.slice(1));
+    let k = h.get('key') || '';
+    if (k) { localStorage.setItem('dopploc_key', k); history.replaceState(null, '', location.pathname); }
+    else { k = localStorage.getItem('dopploc_key') || ''; }
+    if (k) { fetch('/dopploc-auth', {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({key: k})}).then(r => { if (!r.ok) localStorage.removeItem('dopploc_key'); }); }
+    return k;
+  } catch (e) { return ''; }
+}""")
 
     gr.Markdown(
         "---\nEngine: [digitalis-p/doppler-locate](https://github.com/digitalis-p/doppler-locate) (MIT). "
@@ -513,6 +591,8 @@ with gr.Blocks(title="Doppler Locate playground") as demo:
         "Use only on your own recordings or with the consent of whoever made them.")
 
 if __name__ == "__main__":
-    demo.queue(default_concurrency_limit=4).launch(server_name="0.0.0.0", server_port=int(os.environ.get("PORT", "7860")),
-                                                   max_file_size="150mb",
-                                                   allowed_paths=[str(JOBS)])
+    import uvicorn
+    demo.queue(default_concurrency_limit=4)
+    gr.mount_gradio_app(fast, demo, path="/", max_file_size="150mb",
+                        allowed_paths=[str(JOBS)])
+    uvicorn.run(fast, host="0.0.0.0", port=int(os.environ.get("PORT", "7860")))
