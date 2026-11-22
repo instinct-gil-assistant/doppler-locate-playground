@@ -2,3 +2,4 @@ git+https://github.com/digitalis-p/doppler-locate@ed84e0f066d60833f7e9683c286a1f
 gradio>=5.0
 folium>=0.15
 requests>=2.31
+yt-dlp>=2025.1.1
