@@ -433,6 +433,6 @@ with gr.Blocks(title="Doppler Locate playground") as demo:
         "Use only on your own recordings or with the consent of whoever made them.")
 
 if __name__ == "__main__":
-    demo.queue(default_concurrency_limit=4).launch(server_name="0.0.0.0", server_port=7860,
+    demo.queue(default_concurrency_limit=4).launch(server_name="0.0.0.0", server_port=int(os.environ.get("PORT", "7860")),
                                                    max_file_size="150mb",
                                                    allowed_paths=[str(JOBS)])
