@@ -5,20 +5,28 @@ recording was made by matching them against public ADS-B flight history.
 
 Free-tier design: one job at a time, regional search on a local azimuthal-equidistant
 grid (DOPPLOC_GRID_CRS), bounded scoring, uploads deleted right after each run.
+
+Memory design (512 MB host): this web process imports NO engine modules. Every heavy
+step (type table, tar ingest, search, score) runs as a subprocess, and each step's
+peak child memory is logged.
 """
 
 from __future__ import annotations
 
+import csv
 import json
 import math
 import os
+import re
+import resource
 import shutil
 import subprocess
 import sys
 import threading
 import time
+import tomllib
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime
 from pathlib import Path
 
 import gradio as gr
@@ -36,9 +44,8 @@ MAX_SCORE_CANDIDATES = int(os.environ.get("DOPPLOC_MAX_SCORE", "2500"))
 OFFSET_TOL_S = 10.0
 JOB_LOCK = threading.Lock()
 GH_REPO_API = "https://api.github.com/repos/adsblol/globe_history_{year}/releases/tags/v{tag}-planes-readsb-prod-0"
-
-sys.path.insert(0, os.environ.get("DOPPLOC_SRC", "/opt/doppler-locate/src"))
-from dopploc import adsb, config, detect, geo, report, score  # noqa: E402
+ENGINE_SRC = os.environ.get("DOPPLOC_SRC", "/opt/doppler-locate/src")
+RUNNER = Path(__file__).parent / "score_runner.py"
 
 BANNER = f"""## Doppler Locate - playground
 
@@ -76,10 +83,50 @@ def _check_key(key: str):
         raise gr.Error("Wrong access key.")
 
 
+def _fmt_time(t: float) -> str:
+    t = max(0.0, t)
+    h, rem = divmod(int(round(t)), 3600)
+    m, s = divmod(rem, 60)
+    return f"{h}:{m:02d}:{s:02d}" if h else f"{m}:{s:02d}"
+
+
 def _ffprobe_duration(path: Path) -> float:
     out = subprocess.run(["ffprobe", "-v", "error", "-show_entries", "format=duration",
                           "-of", "csv=p=0", str(path)], check=True, capture_output=True, text=True)
     return float(out.stdout.strip())
+
+
+def _engine_env(extra: dict | None = None) -> dict:
+    env = dict(os.environ)
+    env["PYTHONPATH"] = ENGINE_SRC + (os.pathsep + env["PYTHONPATH"] if env.get("PYTHONPATH") else "")
+    env.update(extra or {})
+    return env
+
+
+def run_cli(args: list[str], log, timeout: int = 3600, quiet_prefixes=("|", "source:")) -> tuple[int, list[str]]:
+    """Run an engine CLI subprocess, streaming its output to log. Returns (rc, output lines)."""
+    proc = subprocess.Popen([sys.executable, "-m", "dopploc.cli"] + args,
+                            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+                            env=_engine_env())
+    assert proc.stdout is not None
+    out_lines = []
+    try:
+        for line in proc.stdout:
+            line = line.rstrip()
+            if not line:
+                continue
+            out_lines.append(line)
+            if any(line.startswith(p) for p in quiet_prefixes):
+                continue
+            log(line)
+        proc.wait(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        proc.wait()
+        raise gr.Error("That step ran too long and was stopped; try a smaller region or shorter audio.")
+    peak_mb = resource.getrusage(resource.RUSAGE_CHILDREN).ru_maxrss // 1024
+    log(f"(step exit {proc.returncode}; peak subprocess memory so far {peak_mb} MB)")
+    return proc.returncode, out_lines
 
 
 def _sweeper():
@@ -159,12 +206,59 @@ def ensure_day(day: str, bbox, log) -> Path:
         parts = fetch_day_public(day, raw, log)
     types = DATA / "ref" / "icao_aircraft_types2.js.gz"
     if not types.exists():
-        adsb.fetch_types(types)
+        rc, _ = run_cli(["fetch-types", "--out", str(types)], log)
+        if rc != 0:
+            raise gr.Error("Could not download the aircraft type table; see log.")
     log("building the regional track table (a few minutes) ...")
-    res = adsb.ingest(parts, out, types, bbox=bbox, workers=2, rows_per_file=2_000_000)
-    log(f"track table: {res['aircraft_in_bbox']:,} aircraft, {res['points']:,} points in region")
+    rc, lines = run_cli(["ingest", day, "--raw", str(raw), "--out", str(out), "--types", str(types),
+                         "--bbox", f"{bbox[0]:.5f}", f"{bbox[1]:.5f}", f"{bbox[2]:.5f}", f"{bbox[3]:.5f}",
+                         "--workers", "1"], log, timeout=7200)
+    if rc != 0:
+        raise gr.Error("Building the regional track table failed; see log.")
+    summary = {}
+    for line in reversed(lines):
+        try:
+            summary = json.loads(line)
+            break
+        except (json.JSONDecodeError, ValueError):
+            continue
+    if summary:
+        log(f"track table: {summary.get('aircraft_in_bbox', 0):,} aircraft, "
+            f"{summary.get('points', 0):,} points in region")
     _trim_data()
     return out
+
+
+def _fetch_url(url: str, dl_root: Path, log) -> Path:
+    """Download a web video's audio track with yt-dlp (subprocess; engine stays unloaded)."""
+    probe = subprocess.run(["yt-dlp", "-J", "--no-playlist", "--", url],
+                           capture_output=True, text=True, timeout=300)
+    if probe.returncode != 0:
+        raise gr.Error("Could not download that URL. YouTube and some sites block "
+                       "datacenter IPs; upload the file instead.")
+    info = json.loads(probe.stdout)
+    raw = f"{info.get('extractor_key', 'web')}-{info.get('id', 'x')}"
+    vid = re.sub(r"[^A-Za-z0-9_.-]", "_", raw)[:80]
+    if len(raw) > 80:
+        import hashlib
+        vid += "-" + hashlib.sha1(raw.encode()).hexdigest()[:10]
+    out = dl_root / vid
+    out.mkdir(parents=True, exist_ok=True)
+    have = sorted(p for p in out.glob("audio.*") if p.suffix not in (".part", ".ytdl", ".json"))
+    if have:
+        return have[0]
+    title = info.get("title") or vid
+    log(f"downloading audio of {title!r} ...")
+    got_run = subprocess.run(["yt-dlp", "--no-playlist", "--no-progress", "-f", "bestaudio/best",
+                              "-o", str(out / "audio.%(ext)s"), "--", url],
+                             capture_output=True, text=True, timeout=1800)
+    if got_run.returncode != 0:
+        raise gr.Error("Could not download that URL. YouTube and some sites block "
+                       "datacenter IPs; upload the file instead.")
+    got = sorted(p for p in out.glob("audio.*") if p.suffix not in (".part", ".ytdl", ".json"))
+    if not got:
+        raise gr.Error("The download produced no audio track; upload the file instead.")
+    return got[0]
 
 
 # ----------------------------------------------------------------- step 1: detect
@@ -186,13 +280,9 @@ def do_detect(key, file_path, url, start, dur):
             src = job / ("upload" + Path(file_path).suffix)
             shutil.copy(file_path, src)
         elif url and url.strip():
-            log("downloading audio track ...")
+            log("resolving URL ...")
             yield "\n".join(lines), None, None, None, None, None, gr.update(), ""
-            try:
-                src, meta = detect.fetch(url.strip(), job / "dl", log=log)
-            except Exception as e:
-                raise gr.Error(f"Could not download that URL ({type(e).__name__}). "
-                               "YouTube and some sites block datacenter IPs; upload the file instead.")
+            src = _fetch_url(url.strip(), job / "dl", log)
         else:
             raise gr.Error("Upload a recording or paste a direct media URL.")
         total = _ffprobe_duration(src)
@@ -209,29 +299,19 @@ def do_detect(key, file_path, url, start, dur):
         yield "\n".join(lines), None, None, None, None, None, gr.update(), ""
         t0 = time.time()
         outdir = job / "detect"
-        proc = subprocess.Popen([sys.executable, "-m", "dopploc.cli", "detect", str(src),
-                                 "--start", str(start), "--duration", str(dur),
-                                 "--out", str(outdir)],
-                                stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
-                                env=dict(os.environ))
-        assert proc.stdout is not None
-        for line in proc.stdout:
-            line = line.rstrip()
-            if line and not line.startswith("|") and not line.startswith("source:"):
-                log(line)
-        proc.wait(timeout=3600)
-        if proc.returncode != 0:
+        rc, _ = run_cli(["detect", str(src), "--start", str(start), "--duration", str(dur),
+                         "--out", str(outdir)], log)
+        if rc != 0:
             raise gr.Error("Detection failed; see log.")
         log(f"detection took {time.time() - t0:.0f} s")
 
         rep = (outdir / "report.md").read_text()
         det = json.loads((outdir / "detections.json").read_text())
-        import tomllib
         events_doc = tomllib.loads((outdir / "events.toml").read_text()) if (outdir / "events.toml").exists() else {}
         events = events_doc.get("event", [])
         fly = det.get("flyovers", [])
         strong = [f for f in fly if f.get("confidence") != "low" and f.get("kind") == "aircraft"]
-        choices = [f"{n}: t={detect.fmt_time(f['t_cpa'])} f0={f['f0']:.0f} Hz v={f['v']:.0f} m/s "
+        choices = [f"{n}: t={_fmt_time(f['t_cpa'])} f0={f['f0']:.0f} Hz v={f['v']:.0f} m/s "
                    f"d={f['d']:.0f} m ({f['confidence']})" for n, f in enumerate(strong)]
         default = choices[:2] if len(choices) >= 2 else choices
         state = {"job": str(job), "src": str(src), "events": events, "strong": strong}
@@ -288,9 +368,7 @@ def do_locate(key, state, picks, day, lat, lon, radius_km):
         log(f"region: {radius_km:.0f} km around {lat:.4f},{lon:.4f}; day {day} (UTC)")
         yield "\n".join(lines), None, None, None, None
         crs = (f"+proj=aeqd +lat_0={lat:.5f} +lon_0={lon:.5f} +datum=WGS84 +units=m +no_defs")
-        os.environ["DOPPLOC_GRID_CRS"] = crs
-        geo.GRID_CRS = crs
-        geo._transformers.cache_clear()
+        os.environ["DOPPLOC_GRID_CRS"] = crs  # picked up by every engine subprocess (JOB_LOCK serializes jobs)
 
         adsb_dir = ensure_day(day, bbox, log)
         yield "\n".join(lines), None, None, None, None
@@ -323,54 +401,56 @@ ratio = 1.0
 """)
         log("searching the region ...")
         yield "\n".join(lines), None, None, None, None
-        env = dict(os.environ)
-        proc = subprocess.run([sys.executable, "-m", "dopploc.cli", "search", str(case_toml)],
-                              capture_output=True, text=True, env=env, timeout=1800)
-        lines += [l for l in proc.stdout.strip().splitlines() if l.strip()][-12:]
-        if proc.returncode != 0:
-            log(proc.stderr[-1500:])
+        rc, _ = run_cli(["search", str(case_toml)], log, timeout=1800,
+                        quiet_prefixes=("|",))
+        if rc != 0:
             raise gr.Error("Search failed; see log.")
         yield "\n".join(lines), None, None, None, None
 
-        import polars as pl
-        cand = pl.read_parquet(out / "candidates.parquet")
-        cand = cand.filter(pl.col("heard_between") == 0)
-        n_all = len(cand)
-        if n_all == 0:
-            raise gr.Error("No candidate spot in this region matched both flyovers. "
-                           "Try a wider region, a different day, or other detections.")
-        trimmed = False
-        if n_all > MAX_SCORE_CANDIDATES:
-            cand = cand.sort(pl.col("offset_err").abs()).head(MAX_SCORE_CANDIDATES)
-            trimmed = True
-        log(f"modelling and scoring {len(cand)} candidate spots"
-            + (f" (of {n_all:,}; kept the {MAX_SCORE_CANDIDATES:,} with the tightest event timing)" if trimmed else "")
-            + " ...")
+        log(f"modelling and scoring candidates (cap {MAX_SCORE_CANDIDATES:,}) ...")
         yield "\n".join(lines), None, None, None, None
         t0 = time.time()
-        case = config.load(case_toml)
-        res = score.score_candidates(case, cand, log=log, refine=False, fine_top=300)
-        report.write(case, res, top=15)
-        log(f"scoring took {time.time() - t0:.0f} s")
+        proc = subprocess.run([sys.executable, str(RUNNER), str(case_toml), "15"],
+                              capture_output=True, text=True, timeout=5400,
+                              env=_engine_env({"DOPPLOC_GRID_CRS": crs}))
+        cand_line = next((l for l in proc.stdout.splitlines() if l.startswith("CANDIDATES ")), "")
+        m = re.search(r"all=(\d+) scored=(\d+) trimmed=(\w+)", cand_line)
+        if proc.returncode == 3 or (m and int(m.group(1)) == 0):
+            raise gr.Error("No candidate spot in this region matched both flyovers. "
+                           "Try a wider region, a different day, or other detections.")
+        lines += [l for l in proc.stdout.strip().splitlines()
+                  if l.strip() and not l.startswith("CANDIDATES")][-8:]
+        if proc.returncode != 0:
+            log(proc.stderr[-1500:])
+            raise gr.Error("Scoring failed; see log.")
+        if m:
+            n_all, n_scored, trimmed = int(m.group(1)), int(m.group(2)), m.group(3) == "True"
+            log(f"scored {n_scored:,} candidate spots"
+                + (f" of {n_all:,} (kept the {n_scored:,} with the tightest event timing)" if trimmed else ""))
+        peak_mb = resource.getrusage(resource.RUSAGE_CHILDREN).ru_maxrss // 1024
+        log(f"scoring took {time.time() - t0:.0f} s (peak subprocess memory so far {peak_mb} MB)")
 
-        best = pl.read_csv(out / "best_per_pair.csv")
-        top = best.head(25)
+        with open(out / "best_per_pair.csv", newline="") as f:
+            best_rows = list(csv.DictReader(f))
+        top = best_rows[:25]
         rows = []
-        for i, r in enumerate(top.iter_rows(named=True), 1):
-            rows.append({"rank": i, "lat": round(r["lat"], 5), "lon": round(r["lon"], 5),
-                         "score": round(r["score"], 3),
+        for i, r in enumerate(top, 1):
+            rlat, rlon = float(r["lat"]), float(r["lon"])
+            rows.append({"rank": i, "lat": round(rlat, 5), "lon": round(rlon, 5),
+                         "score": round(float(r["score"]), 3),
                          "flight 1": r["f1"].split(":")[0], "flight 2": r["f2"].split(":")[0],
-                         "map": f"https://www.openstreetmap.org/?mlat={r['lat']:.5f}&mlon={r['lon']:.5f}#map=16/{r['lat']:.5f}/{r['lon']:.5f}"})
+                         "map": f"https://www.openstreetmap.org/?mlat={rlat:.5f}&mlon={rlon:.5f}#map=16/{rlat:.5f}/{rlon:.5f}"})
         import folium
-        m = folium.Map(location=[lat, lon], zoom_start=10)
+        fmap = folium.Map(location=[lat, lon], zoom_start=10)
         folium.Circle([lat, lon], radius=radius_km * 1000, color="#888", weight=1,
-                      fill=False, dash_array="4").add_to(m)
-        for i, r in enumerate(top.head(15).iter_rows(named=True), 1):
+                      fill=False, dash_array="4").add_to(fmap)
+        for i, r in enumerate(top[:15], 1):
+            rlat, rlon = float(r["lat"]), float(r["lon"])
             color = "#d33" if i == 1 else ("#e83e8c" if i <= 3 else "#2b7bbb")
-            folium.CircleMarker([r["lat"], r["lon"]], radius=7 if i == 1 else 5, color=color,
+            folium.CircleMarker([rlat, rlon], radius=7 if i == 1 else 5, color=color,
                                 fill=True, fill_opacity=0.85,
-                                popup=f"#{i} score {r['score']:.2f}").add_to(m)
-        map_html = m._repr_html_()
+                                popup=f"#{i} score {float(r['score']):.2f}").add_to(fmap)
+        map_html = fmap._repr_html_()
         summary = (out / "summary.md").read_text() if (out / "summary.md").exists() else ""
         rank1 = str(out / "rank1.png") if (out / "rank1.png").exists() else None
         log("done.")

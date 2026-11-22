@@ -14,7 +14,7 @@ RUN git clone --depth 1 https://github.com/digitalis-p/doppler-locate /opt/doppl
 COPY geo_patch.py /tmp/geo_patch.py
 RUN python /tmp/geo_patch.py && rm /tmp/geo_patch.py
 
-COPY app.py .
+COPY app.py score_runner.py ./
 
 ENV DOPPLOC_WORK=/tmp/doppler-web-work \
     DOPPLOC_DATA=/tmp/doppler-data \
