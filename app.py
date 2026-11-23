@@ -33,7 +33,7 @@ import hmac as _hmac
 
 import gradio as gr
 from fastapi import FastAPI, Request
-from fastapi.responses import JSONResponse, RedirectResponse
+from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 
 ROOT = Path(os.environ.get("DOPPLOC_WORK", "/tmp/doppler-web-work"))
 JOBS = ROOT / "jobs"
@@ -48,14 +48,15 @@ APP_KEY = os.environ.get("DOPPLOC_APP_KEY", "")
 import hashlib
 AUTH_COOKIE = "dopploc_auth"
 AUTH_TOKEN = hashlib.sha256(("dopploc-gate:" + APP_KEY).encode()).hexdigest() if APP_KEY else ""
-PROTECTED_PREFIXES = ("/upload", "/file", "/queue", "/gradio_api/queue", "/gradio_api/call",
-                      "/gradio_api/upload", "/gradio_api/component_server")
+PROTECTED_PREFIXES = ("/upload", "/file", "/queue", "/gradio_api")
 
 fast = FastAPI()
 
 
 @fast.middleware("http")
 async def _gate(request, call_next):
+    if AUTH_TOKEN and request.url.path == "/" and request.cookies.get(AUTH_COOKIE) != AUTH_TOKEN:
+        return HTMLResponse("<html><body style='font:18px sans-serif;max-width:36rem;margin:4rem auto'><h1>Doppler Locate</h1><p>Open your private invitation link to enter. No access key is needed.</p><p>If your invitation was already used on another browser, ask for a fresh invitation.</p></body></html>")
     if AUTH_TOKEN and request.url.path.startswith(PROTECTED_PREFIXES):
         if request.cookies.get(AUTH_COOKIE) != AUTH_TOKEN:
             return JSONResponse({"detail": "forbidden"}, status_code=403)
@@ -76,21 +77,62 @@ async def _dopploc_auth(request: Request):
     return JSONResponse({"ok": False}, status_code=403)
 
 
+USED_INVITES = DATA / "used_invites.json"
+INVITE_LOCK = threading.Lock()
+
+
+def _invite_ok(exp: int, sig: str) -> bool:
+    if not (APP_KEY and exp and sig):
+        return False
+    good = _hmac.new(APP_KEY.encode(), f"invite:{exp}".encode(), hashlib.sha256).hexdigest()
+    return _hmac.compare_digest(sig.strip(), good) and time.time() < exp
+
+
+def _used_invites():
+    try:
+        return set(json.loads(USED_INVITES.read_text()))
+    except FileNotFoundError:
+        return set()
+
+
 @fast.get("/dopploc-invite")
-async def _dopploc_invite(exp: int = 0, sig: str = ""):
-    """Expiring invite link: HMAC(APP_KEY, 'invite:<exp>') - carries no persistent
-    secret, dies at <exp>. Sets the same derived session cookie as the key flow."""
-    ok = False
-    if APP_KEY and exp and sig:
-        good = _hmac.new(APP_KEY.encode(), f"invite:{exp}".encode(), hashlib.sha256).hexdigest()
-        if _hmac.compare_digest(sig.strip(), good) and time.time() < exp:
-            ok = True
-    if not ok or not AUTH_TOKEN:
+async def _dopploc_invite_page(exp: int = 0, sig: str = ""):
+    if not _invite_ok(exp, sig) or not AUTH_TOKEN:
+        return HTMLResponse("<p>This invitation is invalid or expired.</p>", status_code=403)
+    if sig in _used_invites():
+        return HTMLResponse("<p>This invitation was already used. Open the app in the browser where you first used it, or ask for a fresh invitation.</p>", status_code=410)
+    return HTMLResponse(
+        "<html><body style='font:18px sans-serif;max-width:36rem;margin:4rem auto'>"
+        "<h1>Doppler Locate - playground</h1><p>Open the app on this browser. No access key is needed. You stay signed in for 30 days.</p>"
+        f"<form method='post' action='/dopploc-invite'><input type='hidden' name='exp' value='{exp}'>"
+        f"<input type='hidden' name='sig' value='{sig}'>"
+        "<button style='font-size:1.1rem;padding:.8rem 1.4rem'>Open the playground</button></form></body></html>")
+
+
+@fast.post("/dopploc-invite")
+async def _dopploc_invite_redeem(request: Request):
+    form = await request.form()
+    try:
+        exp = int(str(form.get("exp", "0")))
+    except ValueError:
         return JSONResponse({"ok": False}, status_code=403)
+    sig = str(form.get("sig", ""))
+    with INVITE_LOCK:
+        if not _invite_ok(exp, sig) or not AUTH_TOKEN:
+            return JSONResponse({"ok": False}, status_code=403)
+        used = _used_invites()
+        if sig in used:
+            return HTMLResponse("<p>This invitation was already used.</p>", status_code=410)
+        used.add(sig)
+        tmp = USED_INVITES.with_suffix(".tmp")
+        tmp.write_text(json.dumps(sorted(used)))
+        tmp.replace(USED_INVITES)
     r = RedirectResponse("/", status_code=303)
     r.set_cookie(AUTH_COOKIE, AUTH_TOKEN, httponly=True, secure=True,
                  samesite="lax", max_age=60 * 60 * 24 * 30)
     return r
+
+
 MAX_AUDIO_S = 20 * 60
 MAX_RADIUS_KM = 60
 MAX_SCORE_CANDIDATES = int(os.environ.get("DOPPLOC_MAX_SCORE", "2500"))
@@ -120,8 +162,7 @@ an independent re-implementation of the method from colsto's video.
   the region. Progress is shown live; keep the tab open.
 - ADS-B history is available for recent months (adsb.lol). Recordings need propeller
   aircraft passing within a few kilometres; jets and quiet electric drones won't register.
-- Scoring here models still air (wind aloft is not fetched in this build), so expect
-  the right neighbourhood rather than survey-grade coordinates.
+- Scoring here models still air (wind aloft is not fetched in this build), and hosted validation did not recover a known recording location. Treat this as an experiment, not a reliable locator.
 
 **Read results with care:** the search always returns best-fit candidates for the region
 you chose - it can return a plausible-looking ranked list even when the recording is not
@@ -136,9 +177,10 @@ shared. One analysis runs at a time; if the app is busy, try again in a few minu
 
 # ----------------------------------------------------------------- helpers
 
-def _check_key(key: str, key_link: str = ""):
-    if APP_KEY and (key or "").strip() != APP_KEY and (key_link or "").strip() != APP_KEY:
-        raise gr.Error("Wrong access key.")
+def _check_session(request: gr.Request):
+    if APP_KEY and (request is None or not _hmac.compare_digest(
+            str(request.cookies.get(AUTH_COOKIE, "")), AUTH_TOKEN)):
+        raise gr.Error("Open your private invitation link in this browser first. No access key is needed.")
 
 
 def _fmt_time(t: float) -> str:
@@ -321,8 +363,8 @@ def _fetch_url(url: str, dl_root: Path, log) -> Path:
 
 # ----------------------------------------------------------------- step 1: detect
 
-def do_detect(key, key_link, file_path, url, start, dur):
-    _check_key(key, key_link)
+def do_detect(key, key_link, file_path, url, start, dur, request: gr.Request):
+    _check_session(request)
     if not JOB_LOCK.acquire(blocking=False):
         raise gr.Error("Another analysis is running - try again in a few minutes.")
     job = JOBS / uuid.uuid4().hex[:12]
@@ -382,8 +424,8 @@ def do_detect(key, key_link, file_path, url, start, dur):
 
 # ----------------------------------------------------------------- step 2: locate
 
-def do_locate(key, key_link, state, picks, day, lat, lon, radius_km):
-    _check_key(key, key_link)
+def do_locate(key, key_link, state, picks, day, lat, lon, radius_km, request: gr.Request):
+    _check_session(request)
     if not state or not state.get("events"):
         raise gr.Error("Run Detect first.")
     picks = picks or []
@@ -524,8 +566,8 @@ ratio = 1.0
 
 with gr.Blocks(title="Doppler Locate playground") as demo:
     gr.Markdown(BANNER)
-    key_in = gr.Textbox(label="Access key", type="password",
-                        placeholder="filled automatically from your private link")
+    gr.Markdown("Signed in on this browser. No access key is needed.")
+    key_in = gr.Textbox(visible=False)
     key_link = gr.Textbox(visible=False)
     with gr.Group():
         gr.Markdown("### 1 - Find aircraft in a recording")
@@ -569,20 +611,7 @@ with gr.Blocks(title="Doppler Locate playground") as demo:
     locate_btn.click(do_locate, [key_in, key_link, detect_state, picks_in, day_in, lat_in, lon_in, radius_in],
                      [locate_log, locate_summary, locate_img, locate_map, locate_table])
 
-    key_in.change(None, key_in, None, js="""(k) => {
-  if (k) { fetch('/dopploc-auth', {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({key: k})}).then(r => { if (r.ok) localStorage.setItem('dopploc_key', k); }); }
-}""")
-
-    demo.load(None, None, key_link, js="""() => {
-  try {
-    const h = new URLSearchParams(location.hash.slice(1));
-    let k = h.get('key') || '';
-    if (k) { localStorage.setItem('dopploc_key', k); history.replaceState(null, '', location.pathname); }
-    else { k = localStorage.getItem('dopploc_key') || ''; }
-    if (k) { fetch('/dopploc-auth', {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({key: k})}).then(r => { if (!r.ok) localStorage.removeItem('dopploc_key'); }); }
-    return k;
-  } catch (e) { return ''; }
-}""")
+    demo.load(None, None, None, js="() => { localStorage.removeItem('dopploc_key'); if (location.hash) history.replaceState(null, '', location.pathname); }")
 
     gr.Markdown(
         "---\nEngine: [digitalis-p/doppler-locate](https://github.com/digitalis-p/doppler-locate) (MIT). "
