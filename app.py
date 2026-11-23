@@ -375,13 +375,13 @@ def do_detect(key, key_link, file_path, url, start, dur, request: gr.Request):
         lines.append(" ".join(str(x) for x in a))
 
     try:
-        yield "\n".join(lines), None, None, None, None, None, gr.update(choices=[], value=[]), ""
+        yield "\n".join(lines), None, None, None, None, None, gr.update(choices=[], value=[]), "Detection running. Wait for the result below.", gr.update(interactive=False)
         if file_path:
             src = job / ("upload" + Path(file_path).suffix)
             shutil.copy(file_path, src)
         elif url and url.strip():
             log("resolving URL ...")
-            yield "\n".join(lines), None, None, None, None, None, gr.update(), ""
+            yield "\n".join(lines), None, None, None, None, None, gr.update(), "Detection running. Wait for the result below.", gr.update(interactive=False)
             src = _fetch_url(url.strip(), job / "dl", log)
         else:
             raise gr.Error("Upload a recording or paste a direct media URL.")
@@ -396,7 +396,7 @@ def do_detect(key, key_link, file_path, url, start, dur, request: gr.Request):
             dur = float(MAX_AUDIO_S)
             log(f"analysing only {MAX_AUDIO_S // 60} min of the selected range (free-tier cap)")
         log(f"recording {total / 60:.1f} min; analysing {start:.0f}-{start + dur:.0f} s ...")
-        yield "\n".join(lines), None, None, None, None, None, gr.update(), ""
+        yield "\n".join(lines), None, None, None, None, None, gr.update(), "Detection running. Wait for the result below.", gr.update(interactive=False)
         t0 = time.time()
         outdir = job / "detect"
         rc, _ = run_cli(["detect", str(src), "--start", str(start), "--duration", str(dur),
@@ -408,16 +408,44 @@ def do_detect(key, key_link, file_path, url, start, dur, request: gr.Request):
         rep = (outdir / "report.md").read_text()
         det = json.loads((outdir / "detections.json").read_text())
         events_doc = tomllib.loads((outdir / "events.toml").read_text()) if (outdir / "events.toml").exists() else {}
-        events = events_doc.get("event", [])
+        exported = events_doc.get("event", [])
+        # events.toml can omit unrefined curves and include close-range sources.
+        # Pair by CPA, not by position in two differently filtered lists.
         fly = det.get("flyovers", [])
-        strong = [f for f in fly if f.get("confidence") != "low" and f.get("kind") == "aircraft"]
+        strong, events = [], []
+        for f in fly:
+            if f.get("confidence") == "low" or f.get("kind") != "aircraft":
+                continue
+            e = next((e for e in exported
+                      if abs(float(e["audio_cpa"]) - float(f["t_cpa"])) < 0.01), None)
+            if e is not None:
+                strong.append(f)
+                events.append(e)
         choices = [f"{n}: t={_fmt_time(f['t_cpa'])} f0={f['f0']:.0f} Hz v={f['v']:.0f} m/s "
                    f"d={f['d']:.0f} m ({f['confidence']})" for n, f in enumerate(strong)]
-        default = choices[:2] if len(choices) >= 2 else choices
-        state = {"job": str(job), "src": str(src), "events": events, "strong": strong}
+        default = choices[:2]
+        count = len(events)
+        status = (f"Detection complete: {count} usable aircraft flyovers. Select exactly two, then Locate."
+                  if count >= 2 else
+                  f"Detection complete: {count} usable aircraft flyovers. Locate needs two. "
+                  "Low-confidence curves and close-range sounds are not usable for matching. "
+                  "Try a longer recording or another section with two clear propeller-aircraft passes.")
+        weak = sum(f.get("kind") == "aircraft" and f.get("confidence") == "low" for f in fly)
+        close = sum(f.get("kind") == "close" for f in fly)
+        headline = ("Ready to try Locate" if count >= 2 else "Not enough usable aircraft passes to locate")
+        explanation = ("Choose exactly two aircraft passes below, then enter the UTC date and area."
+                       if count >= 2 else
+                       "Detect did run successfully. Locate needs two usable aircraft passes, so it cannot continue with this result. "
+                       "This does not prove there is no aircraft in the recording. Try a longer recording or another section with two clear propeller-aircraft passes.")
+        readable = (f"### {headline}\n\n**{count} usable aircraft passes** \n"
+                    f"{weak} weak aircraft-like candidates, excluded from locating. \n"
+                    f"{close} close-range sounds (for example, vehicles), excluded.\n\n{explanation}")
+        log(status)
+        state = {"job": str(job), "src": str(src), "events": events,
+                 "strong": strong, "status": "complete"}
         png = str(outdir / "detections.png") if (outdir / "detections.png").exists() else None
-        yield ("\n".join(lines) + "\n\n" + rep, rep, png, state, str(outdir / "events.toml"),
-               str(outdir / "detections.json"), gr.update(choices=choices, value=default), "")
+        yield ("\n".join(lines), readable, png, state, str(outdir / "events.toml"),
+               str(outdir / "detections.json"), gr.update(choices=choices, value=default), status, gr.update(interactive=count >= 2))
     finally:
         JOB_LOCK.release()
 
@@ -426,8 +454,15 @@ def do_detect(key, key_link, file_path, url, start, dur, request: gr.Request):
 
 def do_locate(key, key_link, state, picks, day, lat, lon, radius_km, request: gr.Request):
     _check_session(request)
-    if not state or not state.get("events"):
-        raise gr.Error("Run Detect first.")
+    if not state:
+        raise gr.Error("No completed detection result in this session. Run Detect and wait for it to finish. "
+                       "If you reloaded the page or the server restarted, the previous result has expired.")
+    if len(state.get("events", [])) < 2:
+        raise gr.Error("Detection completed, but found fewer than two usable aircraft flyovers. "
+                       "Low-confidence curves and close-range sounds cannot be matched. "
+                       "Try a longer recording or another section with two clear propeller-aircraft passes.")
+    if not Path(state["src"]).exists():
+        raise gr.Error("This detection has expired and its recording was deleted. Run Detect again.")
     picks = picks or []
     if len(picks) != 2:
         raise gr.Error("Pick exactly two detected flyovers (the search matches pairs).")
@@ -579,8 +614,9 @@ with gr.Blocks(title="Doppler Locate playground") as demo:
             start_in = gr.Number(label="start (s)", value=0, minimum=0)
             dur_in = gr.Number(label="analyse at most (s; 0 = whole)", value=0, minimum=0)
             detect_btn = gr.Button("Detect flyovers", variant="primary")
-    detect_log = gr.Textbox(label="progress", lines=8, interactive=False)
     detect_report = gr.Markdown()
+    with gr.Accordion("Technical detection log (optional)", open=False):
+        detect_log = gr.Textbox(label="progress", lines=8, interactive=False)
     detect_img = gr.Image(label="spectrogram with detected flyovers", type="filepath")
     with gr.Row():
         events_dl = gr.File(label="events.toml")
@@ -589,6 +625,8 @@ with gr.Blocks(title="Doppler Locate playground") as demo:
 
     with gr.Group():
         gr.Markdown("### 2 - Locate the recording")
+        gr.Markdown("Locate unlocks only after detection finds at least two usable aircraft flyovers. "
+                    "Low-confidence curves and close-range sounds are excluded.")
         picks_in = gr.CheckboxGroup(label="two flyovers to match (from the detection above)", choices=[])
         with gr.Row():
             day_in = gr.Textbox(label="UTC date of the recording", placeholder="2026-11-21")
@@ -597,7 +635,7 @@ with gr.Blocks(title="Doppler Locate playground") as demo:
             lon_in = gr.Number(label="centre longitude", value=34.78)
             radius_in = gr.Slider(label="search radius (km)", minimum=10, maximum=MAX_RADIUS_KM,
                                   value=30, step=5)
-        locate_btn = gr.Button("Locate", variant="primary")
+        locate_btn = gr.Button("Locate", variant="primary", interactive=False)
     locate_log = gr.Textbox(label="progress", lines=10, interactive=False)
     locate_summary = gr.Markdown()
     locate_img = gr.Image(label="winning pair: modelled curves over the recording", type="filepath")
@@ -607,7 +645,7 @@ with gr.Blocks(title="Doppler Locate playground") as demo:
 
     detect_btn.click(do_detect, [key_in, key_link, file_in, url_in, start_in, dur_in],
                      [detect_log, detect_report, detect_img, detect_state, events_dl, detections_dl,
-                      picks_in, locate_log])
+                      picks_in, locate_log, locate_btn])
     locate_btn.click(do_locate, [key_in, key_link, detect_state, picks_in, day_in, lat_in, lon_in, radius_in],
                      [locate_log, locate_summary, locate_img, locate_map, locate_table])
 
